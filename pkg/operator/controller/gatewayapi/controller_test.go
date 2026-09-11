@@ -2,6 +2,7 @@ package gatewayapi
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	configv1 "github.com/openshift/api/config/v1"
+	operatorcontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
+	listenersetstatuscontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller/listenerset-status"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -390,9 +393,78 @@ func TestReconcileOnlyStartsControllerOnce(t *testing.T) {
 	assert.True(t, ctrl.Started, "fake controller should have been started")
 }
 
+func TestEnsureDependentControllersRetriesPartialIndexRegistration(t *testing.T) {
+	indexer := newRetryingFakeIndexer()
+	indexer.failures[listenersetstatuscontroller.ListenerSetParentGatewayIndex] = 1
+	startCh := make(chan struct{}, 1)
+	ctrl := &testutil.FakeController{T: t, StartNotificationChan: startCh}
+	reconciler := &reconciler{
+		config: Config{
+			DependentControllers: []controller.Controller{ctrl},
+		},
+		fieldIndexer: indexer,
+	}
+
+	err := reconciler.ensureDependentControllers(context.Background())
+	assert.ErrorContains(t, err, "failed to add ListenerSet field indexer")
+	assert.True(t, reconciler.gatewayClassIndexed)
+	assert.False(t, reconciler.listenerSetIndexed)
+	assert.False(t, reconciler.controllersStarted)
+	assert.Equal(t, 1, indexer.calls[operatorcontroller.GatewayClassIndexFieldName])
+	assert.Equal(t, 1, indexer.calls[listenersetstatuscontroller.ListenerSetParentGatewayIndex])
+
+	assert.NoError(t, reconciler.ensureDependentControllers(context.Background()))
+	assert.True(t, reconciler.gatewayClassIndexed)
+	assert.True(t, reconciler.listenerSetIndexed)
+	assert.True(t, reconciler.controllersStarted)
+	assert.Equal(t, 1, indexer.calls[operatorcontroller.GatewayClassIndexFieldName])
+	assert.Equal(t, 2, indexer.calls[listenersetstatuscontroller.ListenerSetParentGatewayIndex])
+	select {
+	case <-startCh:
+	case <-time.After(time.Second):
+		t.Fatal("controller was not started after index registration succeeded")
+	}
+
+	assert.NoError(t, reconciler.ensureDependentControllers(context.Background()))
+	assert.Equal(t, 1, indexer.calls[operatorcontroller.GatewayClassIndexFieldName])
+	assert.Equal(t, 2, indexer.calls[listenersetstatuscontroller.ListenerSetParentGatewayIndex])
+	select {
+	case <-startCh:
+		t.Fatal("controller was started more than once")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 type FakeIndexer struct{}
 
 func (indexer FakeIndexer) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
+	return nil
+}
+
+type retryingFakeIndexer struct {
+	calls      map[string]int
+	failures   map[string]int
+	registered map[string]struct{}
+}
+
+func newRetryingFakeIndexer() *retryingFakeIndexer {
+	return &retryingFakeIndexer{
+		calls:      map[string]int{},
+		failures:   map[string]int{},
+		registered: map[string]struct{}{},
+	}
+}
+
+func (indexer *retryingFakeIndexer) IndexField(_ context.Context, _ client.Object, field string, _ client.IndexerFunc) error {
+	indexer.calls[field]++
+	if indexer.failures[field] > 0 {
+		indexer.failures[field]--
+		return fmt.Errorf("transient failure registering %q", field)
+	}
+	if _, registered := indexer.registered[field]; registered {
+		return fmt.Errorf("indexer conflict: %q", field)
+	}
+	indexer.registered[field] = struct{}{}
 	return nil
 }
 
